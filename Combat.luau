@@ -256,10 +256,11 @@ end
 --==================================================
 -- SERVER-SIDE REGISTRY
 --==================================================
+function Combat.CreateCombat(player)
+	CombatRegistry[player] = Combat.new(player)
+end
+
 function Combat.GetCombat(player)
-	if not CombatRegistry[player] then
-		CombatRegistry[player] = Combat.new(player)
-	end
 	return CombatRegistry[player]
 end
 
@@ -276,6 +277,9 @@ CombatEvent.OnServerEvent:Connect(function(player, action)
 	if not combat.Character or not combat.Humanoid or combat.Humanoid.Health <= 0 then return end
 
 	if action == "Attack" then
+
+		print(CombatRegistry)
+
 		combat:Attack()
 	elseif action == "BlockStart" then
 		combat:StartBlock()
@@ -283,5 +287,4 @@ CombatEvent.OnServerEvent:Connect(function(player, action)
 		combat:StopBlock()
 	end
 end)
-
 return Combat
