@@ -1,3 +1,6 @@
+--Very simple combat system made all in one script. Also i did what u guys asked for i hope
+
+
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CombatEvent = ReplicatedStorage:WaitForChild("CombatEvent")
 
