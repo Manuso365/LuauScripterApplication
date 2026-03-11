@@ -1,59 +1,71 @@
 -- Very simple combat system made all in one script.
 -- Handles attacking, combos, blocking, stun, cooldowns and hit detection server-side.
--- And added more detailed explanation as asked.
 
+-- Services are fetched first so we can access shared storage and networking
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+-- RemoteEvent used by the client to tell the server when the player attacks or blocks
 local CombatEvent = ReplicatedStorage:WaitForChild("CombatEvent")
 
 --==================================================
 -- CONFIG
 --==================================================
--- All combat tuning values are kept here for easy balancing.
+-- These values control how the combat behaves. Keeping them here
+-- makes it easier to adjust balance without touching the logic below.
 
 local MAX_COMBO = 4                -- Maximum number of hits in one combo chain
-local COMBO_RESET_TIME = 1.2       -- If player waits longer than this, combo resets
-local ATTACK_COOLDOWN = 0.35       -- Minimum time between attack inputs
-local BLOCK_DOT_THRESHOLD = 0.5    -- Determines how accurate a block angle must be
-local DAMAGE = 10                  -- Damage dealt per successful hit
-local KNOCKBACK_FORCE = Vector3.new(0,10,40) -- Vertical + forward knockback
+local COMBO_RESET_TIME = 1.2       -- Time before combo resets if player stops attacking
+local ATTACK_COOLDOWN = 0.35       -- Minimum delay between attacks
+local BLOCK_DOT_THRESHOLD = 0.5    -- How precise the blocking direction must be
+local DAMAGE = 10                  -- Damage applied per hit
+local KNOCKBACK_FORCE = Vector3.new(0,10,40) -- Upward + forward push applied to enemies
 local INVINCIBLE_TIME = 0.2        -- Reserved for future invincibility frames
 
 --==================================================
 -- STATE MACHINE CLASS
 --==================================================
--- Simple state controller to prevent conflicting actions
--- (Example: cannot attack while stunned)
+-- Small state system used to prevent actions from overlapping.
+-- Example: a player shouldn't be able to attack while stunned.
 
 local StateMachine = {}
 StateMachine.__index = StateMachine
 
 function StateMachine.new(initial)
+
+	-- Create a new table instance and attach StateMachine methods to it
 	local self = setmetatable({}, StateMachine)
 
-	-- Current state (Idle by default)
+	-- Current state the character is in (Idle if nothing was provided)
 	self.Current = initial or "Idle"
 
-	-- When locked, state cannot be changed (used during stun)
+	-- When locked the state cannot be changed
+	-- This is mainly used when a player is stunned
 	self.Locked = false
 
 	return self
 end
 
--- Changes state only if:
--- 1. Machine is not locked
--- 2. Transition is allowed from current state
+-- Attempts to change the current state
 function StateMachine:Change(newState, allowed)
+
+	-- If the state machine is locked, ignore any state change attempts
 	if self.Locked then return end
+
+	-- Some transitions are restricted.
+	-- If an allowed table is provided, we check if the current state
+	-- is allowed to move into the new state.
 	if allowed and not allowed[self.Current] then return end
+
+	-- If the checks above pass, the state is updated
 	self.Current = newState
 end
 
--- Checks current state
+-- Simple helper to check if the machine is currently in a certain state
 function StateMachine:Is(state)
 	return self.Current == state
 end
 
--- Prevent state changes
+-- Prevent any further state changes
 function StateMachine:Lock()
 	self.Locked = true
 end
@@ -66,53 +78,72 @@ end
 --==================================================
 -- COMBAT CLASS
 --==================================================
--- Each player gets one Combat object stored in CombatRegistry
+-- Each player receives one Combat object.
+-- These objects are stored in CombatRegistry so they can be accessed later.
 
 local Combat = {}
 Combat.__index = Combat
 
--- Stores combat instances for each player
+-- Table used to keep track of which player owns which combat object
 local CombatRegistry = {}
 
 --==================================================
 -- CONSTRUCTOR
 --==================================================
--- Called when a player joins or combat is initialized
+-- Runs when a player first gets their combat system
 
 function Combat.new(player)
+
+	-- Create a new combat instance
 	local self = setmetatable({}, Combat)
-	
-	-- Store references to character components
+
+	-- Store player reference
 	self.Player = player
+
+	-- Wait for character to exist if it hasn't loaded yet
 	self.Character = player.Character or player.CharacterAdded:Wait()
+
+	-- Grab important character components used later
 	self.Humanoid = self.Character:WaitForChild("Humanoid")
 	self.Root = self.Character:WaitForChild("HumanoidRootPart")
 
-	-- Initialize state machine
+	-- Create the player's state machine starting in Idle
 	self.StateMachine = StateMachine.new("Idle")
 
-	-- Combo tracking
+	-- Variables used for combo tracking
 	self.Combo = 0
 	self.LastAttackTime = 0
 
-	-- Cooldown tracking tables
+	-- Tables used to track cooldown timers
 	self.Cooldowns = {}
+
+	-- Stores when each target was last hit so we don't hit them too fast
 	self.TargetHitCooldowns = {}
 
+	-- Whether the player is currently blocking
 	self.Blocking = false
 
-	-- Load attack animations
+	--==================================================
+	-- Animation loading
+	--==================================================
+
 	self.Animations = {}
+
+	-- Folder that contains the attack animations
 	local animFolder = ReplicatedStorage:WaitForChild("CombatAnims")
 
 	for i = 1, MAX_COMBO do
-		-- Animations are expected to be named M1, M2, M3, etc.
+
+		-- Animations follow the naming pattern M1, M2, M3, etc
 		local anim = animFolder:WaitForChild("M"..i)
+
+		-- Load the animation onto the humanoid
 		local track = self.Humanoid:LoadAnimation(anim)
 
-		-- Set high priority so it overrides walk/idle
+		-- Set priority so attack overrides walking animations
 		track.Priority = Enum.AnimationPriority.Action
 
+		-- Store the track in the animations table
 		self.Animations[i] = track
 	end
 
@@ -122,7 +153,7 @@ end
 --==================================================
 -- STATE TRANSITIONS
 --==================================================
--- Defines which states are allowed to transition into others
+-- Defines which states can transition into other states
 
 local AllowedTransitions = {
 	Idle = {Attacking = true, Blocking = true, Stunned = true},
@@ -142,51 +173,72 @@ end
 --==================================================
 -- COOLDOWNS
 --==================================================
--- Uses os.clock() timestamps to track ability usage
+-- Cooldowns use timestamps instead of waiting threads
 
 function Combat:OnCooldown(action)
-	return self.Cooldowns[action] and os.clock() < self.Cooldowns[action]
+
+	-- Check if a cooldown exists for the action
+	local endTime = self.Cooldowns[action]
+
+	-- If the current time is still less than the stored end time,
+	-- the action is still on cooldown
+	return endTime and os.clock() < endTime
 end
 
 function Combat:SetCooldown(action, duration)
+
+	-- Store the time when the cooldown should expire
 	self.Cooldowns[action] = os.clock() + duration
 end
 
--- Prevents hitting the same target multiple times instantly
+-- Prevents hitting the same target too quickly
 function Combat:CanHitTarget(target)
+
+	-- Get the last time the target was hit
 	local lastHit = self.TargetHitCooldowns[target]
+
+	-- Allow hit if target has never been hit or enough time has passed
 	return not lastHit or os.clock() - lastHit >= 0.2
 end
 
 function Combat:RecordTargetHit(target)
+
+	-- Record current time so we know when the last hit occurred
 	self.TargetHitCooldowns[target] = os.clock()
 end
 
 --==================================================
 -- HITBOX SYSTEM
 --==================================================
--- Uses GetPartBoundsInBox to detect characters in front of attacker
+-- Uses spatial query instead of raycasts
 
 function Combat:CreateHitbox(size, offset)
-	-- Position hitbox relative to player's root
+
+	-- Offset the hitbox forward relative to the player's root
 	local cf = self.Root.CFrame * offset
 
 	local params = OverlapParams.new()
+
+	-- Ignore the attacking player's character
 	params.FilterType = Enum.RaycastFilterType.Exclude
 	params.FilterDescendantsInstances = {self.Character}
 
+	-- Get all parts within the defined box
 	local parts = workspace:GetPartBoundsInBox(cf, size, params)
 
 	local hitCharacters = {}
 
 	for _, part in ipairs(parts) do
+
+		-- Move up the hierarchy to find the model that owns the part
 		local model = part:FindFirstAncestorOfClass("Model")
 
 		if model and model ~= self.Character then
+
 			local humanoid = model:FindFirstChild("Humanoid")
 			local root = model:FindFirstChild("HumanoidRootPart")
 
-			-- Only register valid alive humanoids
+			-- Only register characters that actually have a humanoid
 			if humanoid and root and humanoid.Health > 0 then
 				hitCharacters[model] = {Humanoid = humanoid, Root = root}
 			end
@@ -201,27 +253,37 @@ end
 --==================================================
 
 function Combat:StartBlock()
+
+	-- Player can only start blocking while idle
 	if not self:Is("Idle") then return end
+
 	self:ChangeState("Blocking")
+
 	self.Blocking = true
 end
 
 function Combat:StopBlock()
+
 	if self:Is("Blocking") then
 		self:ChangeState("Idle")
 		self.Blocking = false
 	end
 end
 
--- Checks if attack direction is within defender's forward angle
+-- Determines if an attack direction falls within the defender's block angle
 function Combat:IsBlocked(targetPlayer)
-	local targetCombat = self.GetCombat(targetPlayer)
+
+	local targetCombat = Combat.GetCombat(targetPlayer)
+
 	if not targetCombat or not targetCombat.Blocking then return false end
 
+	-- Vector pointing from defender to attacker
 	local directionToAttacker = (self.Root.Position - targetCombat.Root.Position).Unit
+
+	-- Direction the defender is facing
 	local targetLook = targetCombat.Root.CFrame.LookVector
 
-	-- Dot product measures how aligned two directions are
+	-- Dot product measures alignment between the two directions
 	local dot = targetLook:Dot(directionToAttacker)
 
 	return dot > BLOCK_DOT_THRESHOLD
@@ -232,53 +294,66 @@ end
 --==================================================
 
 function Combat:CanAttack()
+
 	if self:OnCooldown("Attack") then return false end
 	if not self:Is("Idle") then return false end
+
 	return true
 end
 
 function Combat:Attack()
+
 	if not self:CanAttack() then return end
 
-	-- Reset combo if player waited too long
+	-- Reset combo if too much time passed
 	if os.clock() - self.LastAttackTime > COMBO_RESET_TIME then
 		self.Combo = 0
 	end
 
+	-- Increase combo counter
 	self.Combo += 1
+
+	-- Loop combo if it exceeds max
 	if self.Combo > MAX_COMBO then
 		self.Combo = 1
 	end
 
 	self.LastAttackTime = os.clock()
+
 	self:SetCooldown("Attack", ATTACK_COOLDOWN)
 
 	self:ChangeState("Attacking")
 
-	-- Play corresponding combo animation
+	-- Play animation matching the combo index
 	local track = self.Animations[self.Combo]
-	if track then track:Play() end
 
-	-- Delay hit detection to sync with animation timing
+	if track then
+		track:Play()
+	end
+
+	-- Delay hit detection slightly so it lines up with animation swing
 	task.delay(0.15, function()
+
 		if not self:Is("Attacking") then return end
 
 		local hits = self:CreateHitbox(Vector3.new(5,5,5), CFrame.new(0,0,-3))
 
 		for model, data in pairs(hits) do
+
 			if self:CanHitTarget(model) then
 
 				local blocked = false
 
-				-- Skip block logic for NPCs
+				-- NPCs don't use the blocking system
 				if not model:IsDescendantOf(workspace:WaitForChild("NPC")) then
 					blocked = self:IsBlocked(model) or false
 				end
 
 				if not blocked then
+
 					data.Humanoid:TakeDamage(DAMAGE)
 
-					-- Apply knockback force
+					-- Apply velocity directly to the root part
 					if data.Root then
 						data.Root.AssemblyLinearVelocity =
 							self.Root.CFrame.LookVector * KNOCKBACK_FORCE.Z
@@ -291,12 +366,14 @@ function Combat:Attack()
 		end
 	end)
 
-	-- Return to idle after attack finishes
+	-- Return back to idle once attack animation should be finished
 	task.delay(0.35, function()
+
 		if self:Is("Attacking") then
+
 			self:ChangeState("Idle")
 
-			-- Extra cooldown at end of full combo
+			-- If this was the final combo hit, apply extra cooldown
 			if self.Combo == MAX_COMBO then
 				self:SetCooldown("Attack", 0.5)
 			end
@@ -309,12 +386,14 @@ end
 --==================================================
 
 function Combat:Stun(duration)
+
 	self:ChangeState("Stunned")
 
-	-- Lock state so player cannot override stun
+	-- Lock state machine so player cannot override stun
 	self.StateMachine:Lock()
 
 	task.delay(duration, function()
+
 		self.StateMachine:Unlock()
 
 		if self:Is("Stunned") then
@@ -326,7 +405,6 @@ end
 --==================================================
 -- SERVER-SIDE REGISTRY
 --==================================================
--- Used to manage all active combat instances
 
 function Combat.CreateCombat(player)
 	CombatRegistry[player] = Combat.new(player)
@@ -343,12 +421,15 @@ end
 --==================================================
 -- REMOTE EVENT HANDLING
 --==================================================
--- Handles client combat requests securely on the server
+-- Client sends action requests which the server validates
 
 CombatEvent.OnServerEvent:Connect(function(player, action)
+
+	-- Ensure the action parameter is valid
 	if typeof(action) ~= "string" then return end
 
 	local combat = Combat.GetCombat(player)
+
 	if not combat then return end
 	if not combat.Character or not combat.Humanoid then return end
 	if combat.Humanoid.Health <= 0 then return end
