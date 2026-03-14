@@ -211,9 +211,6 @@ end
 -- COOLDOWN SYSTEM
 --==================================================
 
--- Instead of using task.wait() timers, cooldowns store
--- the future timestamp when an action becomes available.
-
 function Combat:OnCooldown(action)
 
 	local endTime = self.Cooldowns[action]
@@ -232,21 +229,12 @@ end
 -- HITBOX SYSTEM
 --==================================================
 
--- This system detects characters inside a box-shaped
--- region in front of the attacker.
-
--- Raycasts only detect objects along a line, which works
--- well for projectiles but not for melee attacks. Using
--- GetPartBoundsInBox allows us to check a 3D volume
--- representing the weapon swing.
-
 function Combat:CreateHitbox(size,offset)
 
 	local cf = self.Root.CFrame * offset
 
 	local params = OverlapParams.new()
 
-	-- Exclude the attacker so they cannot hit themselves.
 	params.FilterType = Enum.RaycastFilterType.Exclude
 	params.FilterDescendantsInstances = {self.Character}
 
@@ -284,12 +272,6 @@ end
 -- BLOCKING LOGIC
 --==================================================
 
--- Blocking checks whether the attacker is inside
--- the defender's forward facing direction.
-
--- This is calculated using a dot product between
--- two direction vectors.
-
 function Combat:IsBlocked(targetModel)
 
 	local targetPlayer = game.Players:GetPlayerFromCharacter(targetModel)
@@ -302,13 +284,10 @@ function Combat:IsBlocked(targetModel)
 		return false
 	end
 
-	-- Direction from defender to attacker.
 	local directionToAttacker = (self.Root.Position - targetCombat.Root.Position).Unit
 
-	-- Direction the defender is facing.
 	local targetLook = targetCombat.Root.CFrame.LookVector
 
-	-- Dot product measures directional alignment.
 	local dot = targetLook:Dot(directionToAttacker)
 
 	return dot > BLOCK_DOT_THRESHOLD
@@ -318,10 +297,6 @@ end
 --==================================================
 -- KNOCKBACK SYSTEM
 --==================================================
-
--- Knockback uses VectorForce instead of directly setting
--- velocity. This allows physics to handle the motion
--- more naturally and keeps the force temporary.
 
 function Combat:ApplyKnockback(targetRoot)
 
@@ -345,6 +320,62 @@ function Combat:ApplyKnockback(targetRoot)
 end
 
 --==================================================
+-- STUN SYSTEM (NEW)
+--==================================================
+-- This system allows characters to be temporarily stunned.
+-- When stunned the state machine is locked so no actions
+-- such as attacking or blocking can occur.
+
+function Combat:Stun(duration)
+
+	if self.StateMachine:Is("Stunned") then return end
+
+	self.StateMachine:Change("Stunned",AllowedTransitions)
+
+	self.StateMachine:Lock()
+
+	self.Character:SetAttribute("Stunned",true)
+
+	task.delay(duration,function()
+
+		self.Character:SetAttribute("Stunned",false)
+
+		self.StateMachine:Unlock()
+
+		self.StateMachine:Change("Idle",AllowedTransitions)
+
+	end)
+
+end
+
+--==================================================
+-- BLOCK SYSTEM (NEW)
+--==================================================
+-- Players can hold block which changes their state.
+-- This allows directional block detection during attacks.
+
+function Combat:StartBlock()
+
+	if not self.StateMachine:Is("Idle") then return end
+
+	self.Blocking = true
+	self.LastBlockTime = os.clock()
+
+	self.StateMachine:Change("Blocking",AllowedTransitions)
+
+end
+
+function Combat:StopBlock()
+
+	if not self.StateMachine:Is("Blocking") then return end
+
+	self.Blocking = false
+
+	self.StateMachine:Change("Idle",AllowedTransitions)
+
+end
+
+--==================================================
 -- ATTACK SYSTEM
 --==================================================
 
@@ -353,7 +384,6 @@ function Combat:Attack()
 	if self:OnCooldown("Attack") then return end
 	if not self.StateMachine:Is("Idle") then return end
 
-	-- Reset combo if too much time passes.
 	if os.clock() - self.LastAttackTime > COMBO_RESET_TIME then
 		self.Combo = 0
 	end
@@ -382,9 +412,31 @@ function Combat:Attack()
 
 		for model,data in pairs(hits) do
 
-			data.Humanoid:TakeDamage(DAMAGE)
+			-- NEW: check if the attack is blocked
+			if not self:IsBlocked(model) then
 
-			self:ApplyKnockback(data.Root)
+				data.Humanoid:TakeDamage(DAMAGE)
+
+				self:ApplyKnockback(data.Root)
+
+				-- NEW: final combo hit applies stun
+				if self.Combo == MAX_COMBO then
+
+					local targetPlayer = game.Players:GetPlayerFromCharacter(model)
+
+					if targetPlayer then
+
+						local targetCombat = Combat.GetCombat(targetPlayer)
+
+						if targetCombat then
+							targetCombat:Stun(1)
+						end
+
+					end
+
+				end
+
+			end
 
 		end
 
@@ -408,6 +460,28 @@ function Combat.RemoveCombat(player)
 end
 
 --==================================================
+-- PLAYER SETUP SYSTEM (NEW)
+--==================================================
+-- This automatically creates combat objects for players
+-- when their character spawns and removes them when they leave.
+
+game.Players.PlayerAdded:Connect(function(player)
+
+	player.CharacterAdded:Connect(function()
+
+		Combat.CreateCombat(player)
+
+	end)
+
+end)
+
+game.Players.PlayerRemoving:Connect(function(player)
+
+	Combat.RemoveCombat(player)
+
+end)
+
+--==================================================
 -- REMOTE EVENT HANDLER
 --==================================================
 
@@ -422,6 +496,15 @@ CombatEvent.OnServerEvent:Connect(function(player,action)
 
 	if action == "Attack" then
 		combat:Attack()
+	end
+
+	-- NEW: block input handling
+	if action == "BlockStart" then
+		combat:StartBlock()
+	end
+
+	if action == "BlockStop" then
+		combat:StopBlock()
 	end
 
 end)
